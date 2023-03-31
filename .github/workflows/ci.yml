@@ -60,7 +60,7 @@ jobs:
           netlify-config-path: ./netlify.toml
           publish-dir: 'dist/public'
           functions-dir: 'dist/functions'
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GH_TOKEN }}
           deploy-message: GHA Deploy - ${{ github.event.head_commit.message }}
           enable-commit-status: true
           enable-pull-request-comment: false
