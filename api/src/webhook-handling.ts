@@ -92,28 +92,31 @@ export async function updateTeamData(email: string, subscription: Partial<Paying
     }
 }
 
-export async function reportSuccessfulCheckout(passthroughData: string | undefined) {
-    let parsedPassthrough: Record<string, string | undefined> | undefined = undefined;
+export function parseCheckoutPassthrough(passthroughData: string | undefined) {
     try {
         if (!passthroughData) {
             throw new Error('Passthrough was empty');
         }
 
-        parsedPassthrough = JSON.parse(passthroughData) ?? {};
+        const parsedPassthrough = JSON.parse(passthroughData) ?? {};
 
         if (!Object.keys(parsedPassthrough!).length) {
             throw new Error('Parsed passthrough data has no content');
         }
+
+        return parsedPassthrough as Record<string, string | undefined>;
     } catch (e) {
         console.log(e);
         reportError(`Failed to parse passthrough data: ${(e as Error).message ?? e}`);
-        // We report errors here, but continue - we just skip metrics in this case
+        // We report errors here, but continue - we'll just skip metrics in this case
     }
+}
 
-    if (parsedPassthrough?.id) { // Set in redirect-to-checkout
-        const sessionId = parsedPassthrough.id;
-        // Track successes, so we can calculate checkout conversion rates:
-        trackEvent(sessionId, 'Checkout', 'Success');
-        await flushMetrics();
-    }
+// Independently of overall stats, we also log checkout events so we can measure failures:
+export async function reportSuccessfulCheckout(checkoutId: string | undefined) {
+    if (!checkoutId) return; // Set in redirect-to-checkout, so may not exist for manual checkouts
+
+    // Track successes, so we can calculate checkout conversion rates:
+    trackEvent(checkoutId, 'Checkout', 'Success');
+    await flushMetrics();
 }

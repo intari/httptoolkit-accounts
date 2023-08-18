@@ -1,17 +1,20 @@
 import * as _ from 'lodash';
 import NodeCache from 'node-cache';
 
-import { reportError } from './errors';
+import { reportError, StatusError } from './errors';
 
 import type {
     TransactionData,
     UserAppData,
     UserBillingData
 } from '../../module/src/types';
+import { delay } from '../../module/src/util';
 
 import {
+    getPaddleIdForSku,
     getPaddleUserIdFromSubscription,
-    getPaddleUserTransactions
+    lookupPaddleUserTransactions,
+    getSkuForPaddleId
 } from './paddle';
 import {
     authClient,
@@ -26,6 +29,7 @@ import {
     getSku,
     isTeamSubscription
 } from './products';
+import { lookupPayProOrders } from './paypro';
 
 type RawMetadata = Partial<AppMetadata> & {
     email: string;
@@ -36,7 +40,7 @@ type RawMetadata = Partial<AppMetadata> & {
 // have no effective subscription (unless they are owner + member).
 export async function getUserAppData(accessToken: string): Promise<UserAppData> {
     const userId = await getUserId(accessToken);
-    const rawUserData = await getRawUserData(userId);
+    const rawUserData = await loadRawUserData(userId);
     return await buildUserAppData(userId, rawUserData) as UserAppData;
 }
 
@@ -45,8 +49,17 @@ export async function getUserAppData(accessToken: string): Promise<UserAppData> 
 // while owners have all their normal subscription state + a list of members.
 export async function getUserBillingData(accessToken: string) {
     const userId = await getUserId(accessToken);
-    const rawUserData = await getRawUserData(userId);
-    return getBillingData(userId, rawUserData);
+    const rawUserData = await loadRawUserData(userId);
+    return buildUserBillingData(userId, rawUserData);
+}
+
+// User base data: the actual data linked to this user, with no extra processing.
+// This is useful when you need the basic subscription data for a user for internal
+// handling, not the full with-invoices with-team-members data that getUserBillingData
+// returns, and not the only-user-visible data that getUserAppData returns.
+export async function getUserBaseData(accessToken: string) {
+    const userId = await getUserId(accessToken);
+    return await loadRawUserData(userId);
 }
 
 // A cache to avoid hitting userinfo unnecessarily.
@@ -60,7 +73,7 @@ export async function getUserId(accessToken: string): Promise<string> {
         return userId;
     } else {
         // getProfile is only minimal data, updated at last login (/userinfo - 5 req/minute/user)
-        const user: { sub: string } | undefined = await authClient.getProfile(accessToken);
+        const user = await getUserProfile(accessToken);
 
         if (!user) {
             throw new Error("User could not be found in getUserId");
@@ -75,19 +88,77 @@ export async function getUserId(accessToken: string): Promise<string> {
     }
 }
 
-async function getRawUserData(userId: string): Promise<RawMetadata> {
+async function getUserProfile(accessToken: string, options: {
+    isRetry?: boolean
+} = {}): Promise<{ sub: string } | undefined> {
+    return authClient.getProfile(accessToken).catch((error) => {
+        console.warn('Auth0 getProfile request rejected:', error.message);
+
+        if (error.message === 'Request failed with status code 401') {
+            throw new StatusError(401, "Unauthorized");
+        }
+
+        // Most other errors are intermittent, so retry, if we haven't already:
+        if (!options.isRetry) {
+            return getUserProfile(accessToken, { isRetry: true });
+        } else {
+            throw new StatusError(502, "Unexpected error from Auth0");
+        }
+    });
+}
+
+async function loadRawUserData(userId: string): Promise<RawMetadata> {
     // getUser is full live data for the user (/users/{id} - 15 req/second)
     const userData = await mgmtClient.getUser({ id: userId });
 
     const metadata = userData.app_metadata;
 
-    return {
+    return migrateOldUserData({
         email: userData.email!,
         ...metadata
-    };
+    });
 }
 
-// All subscription-related properties:
+function migrateOldUserData(data: RawMetadata): RawMetadata {
+    if ('subscription_plan_id' in data && !data.subscription_sku) {
+        data.subscription_sku = getSkuForPaddleId(data.subscription_plan_id);
+    }
+
+    // Just temporarily (remove after May 2023) we return a synthetic subscription_plan_id
+    // even if not present, as a quick hack to avoid breaking old UI implementations:
+    if ('subscription_sku' in data && !data.subscription_plan_id) {
+        data.subscription_plan_id = getPaddleIdForSku(data.subscription_sku ?? 'pro-monthly');
+    }
+
+    // All subscription & paddle ids should be strings now
+    if ('subscription_id' in data && _.isNumber(data.subscription_id)) {
+        data.subscription_id = data.subscription_id.toString();
+    }
+    if ('paddle_user_id' in data && _.isNumber(data.paddle_user_id)) {
+        data.paddle_user_id = data.paddle_user_id.toString();
+    }
+
+    // In old trial/open-source Pro accounts, the quantity often wasn't set explicitly,
+    // which can cause issues in new UI versions. We should drop that in the UI, but
+    // for now it's easier to just backfill the data:
+    if ('subscription_id' in data) {
+        data.subscription_quantity ??= 1;
+    }
+
+    return data;
+}
+
+// We use these internally for some processing, but they're not useful
+// externally so we should avoid returning them from the API:
+const INTERNAL_FIELDS = [
+    'subscription_id',
+    'paddle_user_id',
+    'locked_licenses',
+    'payment_provider'
+] as const;
+
+// All subscription-related properties, which are hidden if the user's
+// subscription data has expired:
 const SUBSCRIPTION_PROPERTIES = [
     'subscription_status',
     'subscription_id',
@@ -102,12 +173,13 @@ const SUBSCRIPTION_PROPERTIES = [
     'team_member_ids',
     'locked_licenses',
     'subscription_owner_id',
-    'joined_team_at'
-];
+    'joined_team_at',
+    'can_manage_subscription'
+] as const;
 
+// The subscription properties extracted from team owners and delegated to members:
 const EXTRACTED_TEAM_SUBSCRIPTION_PROPERTIES = [
     'subscription_status',
-    'subscription_id',
     'subscription_sku',
     'subscription_plan_id',
     'subscription_expiry',
@@ -119,9 +191,9 @@ const EXTRACTED_TEAM_SUBSCRIPTION_PROPERTIES = [
 ] as const;
 
 const DELEGATED_TEAM_SUBSCRIPTION_PROPERTIES = [
-    'subscription_id',
     'subscription_status',
     'subscription_expiry',
+    'subscription_quantity',
     'subscription_sku',
     'subscription_plan_id'
 ] as const;
@@ -129,7 +201,7 @@ const DELEGATED_TEAM_SUBSCRIPTION_PROPERTIES = [
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 async function buildUserAppData(userId: string, rawMetadata: RawMetadata) {
-    const userMetadata: Partial<UserAppData> =_.cloneDeep(rawMetadata);
+    const userMetadata: Partial<UserAppData> = _.cloneDeep(_.omit(rawMetadata, INTERNAL_FIELDS));
 
     const sku = getSku(rawMetadata);
     if (isTeamSubscription(sku)) {
@@ -137,7 +209,6 @@ async function buildUserAppData(userId: string, rawMetadata: RawMetadata) {
         // That means your subscription data isn't actually for *you*, it's for
         // the actual team members. Move it into a separate team_subscription to make that clear.
         userMetadata.team_subscription = {};
-        delete (userMetadata as TeamOwnerMetadata)['locked_licenses'];
         EXTRACTED_TEAM_SUBSCRIPTION_PROPERTIES.forEach((key) => {
             const teamSub = userMetadata.team_subscription as any;
             teamSub[key] = userMetadata[key];
@@ -176,6 +247,28 @@ async function buildUserAppData(userId: string, rawMetadata: RawMetadata) {
         }
     }
 
+    if (userMetadata.subscription_status === 'active' || userMetadata.subscription_status === 'past_due') {
+        userMetadata.can_manage_subscription = userMetadata.subscription_owner_id
+            // If your sub has an owner, you can only manage the subscription if that's you:
+            ? userMetadata.subscription_owner_id === userId
+            // Otherwise, it must be your (Team or Pro) subscription, go wild:
+            : true;
+    }
+
+    // PayPro users need to go to their control panel to update billing details:
+    if (userMetadata.can_manage_subscription && (rawMetadata as PayingUserMetadata).payment_provider === 'paypro') {
+        userMetadata.update_url = 'https://cc.payproglobal.com/Customer/Account/Login';
+    }
+
+    // Annoyingly due to an old implementation issue in the UI
+    // (https://github.com/httptoolkit/httptoolkit-ui/commit/acb42aa9e4c05659beae2039854598c982083ffe)
+    // we need to return some subscription_id in all paid cases, even though it's never used.
+    // We can remove this later (e.g. May 2023) - it will effectively make subscribed users
+    // appear unsubscribed until their UI updates. Most UIs update fairly quickly though.
+    if ('subscription_id' in rawMetadata) { // For paid users only (raw data because this is stripped)
+        (userMetadata as any).subscription_id = -1;
+    }
+
     const metadataExpiry = userMetadata.subscription_expiry
         // No expiry = never expire (shouldn't happen, but just in case):
         ?? Number.POSITIVE_INFINITY;
@@ -201,9 +294,9 @@ function countLockedLicenses(userMetadata: TeamOwnerMetadata) {
         .length;
 }
 
-async function getBillingData(
+async function buildUserBillingData(
     userId: string,
-    rawMetadata: RawMetadata
+    rawMetadata: RawMetadata & Partial<PayingUserMetadata>
 ): Promise<UserBillingData> {
     // Load transactions, team members and team owner in parallel:
     const [transactions, teamMembers, owner, lockedLicenseExpiries] = await Promise.all([
@@ -213,14 +306,30 @@ async function getBillingData(
         getLockedLicenseExpiries(rawMetadata)
     ]);
 
+    let can_manage_subscription = false;
+    if (rawMetadata.subscription_status === 'active' || rawMetadata.subscription_status === 'past_due') {
+        can_manage_subscription = owner
+            // If your sub has an owner, you can only manage the subscription if that's you:
+            ? owner.id === userId
+            // Otherwise, it must be your (Team or Pro) subscription, go wild:
+            : true
+    }
+
+    // PayPro users need to go to their control panel to update billing details:
+    if (can_manage_subscription && rawMetadata.payment_provider === 'paypro') {
+        rawMetadata.update_url = 'https://cc.payproglobal.com/Customer/Account/Login';
+    }
+
     return {
         ..._.cloneDeep(_.omit(rawMetadata, [
             // Filter to just billing related non-duplicated data
             'feature_flags',
             'subscription_owner_id',
             'team_member_ids',
-            'locked_licenses'
+            'locked_licenses',
+            ...INTERNAL_FIELDS
         ])),
+        can_manage_subscription,
         email: rawMetadata.email!,
         transactions,
         team_members: teamMembers,
@@ -229,16 +338,68 @@ async function getBillingData(
     };
 }
 
-// We cache paddle subscription to user id map, which never changes
-const paddleUserIdCache: { [subscriptionId: number]: number } = {};
-// We temporarily cache per-user paddle transactions, since the lookup is *super* slow
-const paddleTransactionsCache = new NodeCache({
+// We temporarily cache per-user transactions for performance (Paddle can be *very* slow)
+const transactionsCache = new NodeCache({
     stdTTL: 60 * 60 // Cached for 1h
 });
 
 async function getTransactions(rawMetadata: RawMetadata) {
     const billingMetadata = rawMetadata as PayingUserMetadata;
 
+    let transactionsRequest: Promise<TransactionData[]>;
+    let transactionsCacheKey: string;
+
+    if (
+        billingMetadata.payment_provider === 'paddle' ||
+        !billingMetadata.payment_provider // Subscriptions that predate multiple providers
+    ) {
+        const paddleUserId = await getPaddleUserId(billingMetadata);
+        if (!paddleUserId) return [];
+
+        transactionsCacheKey = `paddle-${paddleUserId}`
+
+        // We always query for fresh transaction data (even if we might return cached data
+        // below in the meantime)
+        transactionsRequest = lookupPaddleUserTransactions(paddleUserId);
+    } else if (billingMetadata.payment_provider === 'paypro') {
+        transactionsCacheKey = `paypro-${rawMetadata.email}`;
+        transactionsRequest = lookupPayProOrders(rawMetadata.email);
+    } else {
+        throw new Error(`Could not get transactions for unknown payment provider: ${
+            billingMetadata.payment_provider
+        }`);
+    }
+
+    // When the lookup completes, cache the result:
+    transactionsRequest.then((transactions) => {
+        transactionsCache.set(transactionsCacheKey, transactions);
+    });
+
+    if (transactionsCache.has(transactionsCacheKey)) {
+        // If we already have a cache result, we return that for now (transactions will
+        // still update the cache in the background though).
+        return transactionsCache.get<TransactionData[]>(transactionsCacheKey)!;
+    } else {
+        // If there's no cached data, we just wait until the full request is done, like normal:
+        return Promise.race([
+            transactionsRequest.catch((e) => {
+                console.log(`Failed to look up transactions for ${rawMetadata.email}: ${e.message}`);
+                reportError(e);
+                return null;
+            }),
+            // After 15 seconds, give up & return null (will show as 'unavailable' UI side). We
+            // genuinely hit this sometimes because Paddle is remarkably astonishingly bad. On
+            // the plus side, caching means the user can refresh in a minute and this will be
+            // available immediately.
+            delay(15_000).then(() => null)
+        ]);
+    }
+}
+
+// We cache paddle subscription to user id map, which never changes
+const paddleUserIdCache: { [subscriptionId: string | number]: string | number } = {};
+
+async function getPaddleUserId(billingMetadata: PayingUserMetadata) {
     const paddleUserId = billingMetadata.paddle_user_id
         // If not set, read from the cache, from previous user id lookups:
         ?? paddleUserIdCache[billingMetadata.subscription_id!]
@@ -250,23 +411,7 @@ async function getTransactions(rawMetadata: RawMetadata) {
         paddleUserIdCache[billingMetadata.subscription_id!] = paddleUserId;
     }
 
-    if (!paddleUserId) return [];
-
-    // If you have a Paddle account at all, we always query for your transaction data:
-    const transactionsRequest = getPaddleUserTransactions(paddleUserId)
-        .then((transactions) => {
-            paddleTransactionsCache.set(paddleUserId, transactions);
-            return transactions;
-        });
-
-    if (paddleTransactionsCache.has(paddleUserId)) {
-        // If we already have a cache result, we return that for now (transactions will
-        // still update the cache in the background though).
-        return paddleTransactionsCache.get<TransactionData[]>(paddleUserId)!;
-    } else {
-        // If there's no cached data, we just wait until the request is done like normal:
-        return transactionsRequest;
-    }
+    return paddleUserId;
 }
 
 async function getTeamMembers(userId: string, rawMetadata: RawMetadata) {
@@ -335,7 +480,7 @@ async function getTeamOwner(userId: string, rawMetadata: RawMetadata) {
     try {
         const ownerData = (teamMemberData.subscription_owner_id === userId
             ? teamMemberData // If we're in our own team, use that data directly:
-            : await getRawUserData(ownerId)
+            : await loadRawUserData(ownerId)
         ) as TeamOwnerMetadata & { email: string };
 
         const teamMemberIds = ownerData.team_member_ids ?? [];

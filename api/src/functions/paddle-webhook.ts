@@ -1,4 +1,4 @@
-import { initSentry, catchErrors } from '../errors';
+import { initSentry, catchErrors, reportError } from '../errors';
 initSentry();
 
 import _ from 'lodash';
@@ -22,8 +22,10 @@ import {
     banUser,
     reportSuccessfulCheckout,
     updateProUserData,
-    updateTeamData
+    updateTeamData,
+    parseCheckoutPassthrough
 } from '../webhook-handling';
+import { setRevenueTraits } from '../accounting';
 
 function getSubscriptionFromHookData(hookData: PaddleWebhookData): Partial<PayingUserMetadata> {
     if (
@@ -43,8 +45,8 @@ function getSubscriptionFromHookData(hookData: PaddleWebhookData): Partial<Payin
         return {
             subscription_status: hookData.status,
             payment_provider: 'paddle',
-            paddle_user_id: parseInt(hookData.user_id, 10),
-            subscription_id: parseInt(hookData.subscription_id, 10),
+            paddle_user_id: hookData.user_id,
+            subscription_id: hookData.subscription_id,
             subscription_sku: getSkuForPaddleId(planId),
             subscription_plan_id: planId,
             subscription_quantity: parseInt(quantity, 10),
@@ -64,8 +66,8 @@ function getSubscriptionFromHookData(hookData: PaddleWebhookData): Partial<Payin
         return {
             subscription_status: 'deleted',
             payment_provider: 'paddle',
-            paddle_user_id: parseInt(hookData.user_id, 10),
-            subscription_id: parseInt(hookData.subscription_id, 10),
+            paddle_user_id: hookData.user_id,
+            subscription_id: hookData.subscription_id,
             subscription_sku: getSkuForPaddleId(planId),
             subscription_plan_id: planId,
             subscription_expiry: endDate,
@@ -83,8 +85,8 @@ function getSubscriptionFromHookData(hookData: PaddleWebhookData): Partial<Payin
         return {
             subscription_status: hookData.status,
             payment_provider: 'paddle',
-            paddle_user_id: parseInt(hookData.user_id, 10),
-            subscription_id: parseInt(hookData.subscription_id, 10),
+            paddle_user_id: hookData.user_id,
+            subscription_id: hookData.subscription_id,
             subscription_sku: getSkuForPaddleId(planId),
             subscription_plan_id: planId,
             subscription_expiry: endDate,
@@ -105,8 +107,8 @@ function getSubscriptionFromHookData(hookData: PaddleWebhookData): Partial<Payin
         return {
             subscription_status: hookData.next_retry_date ? 'past_due' : 'deleted',
             payment_provider: 'paddle',
-            paddle_user_id: parseInt(hookData.user_id, 10),
-            subscription_id: parseInt(hookData.subscription_id, 10),
+            paddle_user_id: hookData.user_id,
+            subscription_id: hookData.subscription_id,
             subscription_sku: getSkuForPaddleId(planId),
             subscription_plan_id: planId,
             subscription_expiry: endDate,
@@ -125,6 +127,10 @@ export const handler = catchErrors(async (event) => {
 
     validatePaddleWebhook(paddleData);
 
+    // Paddle uses casing in emails, whilst it seems that auth0 does not:
+    // https://community.auth0.com/t/creating-a-user-converts-email-to-lowercase/6678/4
+    const email = paddleData.email.toLowerCase();
+
     if ([
         'subscription_created',
         'subscription_updated',
@@ -132,10 +138,6 @@ export const handler = catchErrors(async (event) => {
         'subscription_payment_succeeded',
         'subscription_payment_failed'
     ].includes(paddleData.alert_name)) {
-        // Paddle uses casing in emails, whilst it seems that auth0 does not:
-        // https://community.auth0.com/t/creating-a-user-converts-email-to-lowercase/6678/4
-        const email = paddleData.email.toLowerCase();
-
         const userData = getSubscriptionFromHookData(paddleData);
         const sku = getSku(userData);
 
@@ -158,15 +160,27 @@ export const handler = catchErrors(async (event) => {
         // to avoid paying for it (and cause us major existential problems in return).
         // In either case, this is abusive behaviour, and we ban them from the app. This results in an alert
         // at startup, telling them to contact support and then insta-closing the app.
-        const email = paddleData.email.toLowerCase();
         await banUser(email);
     } else {
         console.log(`Ignoring ${paddleData.alert_name} event`);
     }
 
-    // Add successful checkouts to our metrics:
+    // Record successful checkouts in our accounting backend & metrics:
     if (paddleData.alert_name === 'subscription_created') {
-        await reportSuccessfulCheckout(paddleData.passthrough);
+        try {
+            const parsedPassthrough = parseCheckoutPassthrough(paddleData.passthrough);
+            const countryCode = parsedPassthrough?.country;
+            await Promise.all([
+                setRevenueTraits(email, {
+                    "Payment provider": 'paddle',
+                    "Country code": countryCode
+                }),
+                reportSuccessfulCheckout(parsedPassthrough?.id)
+            ]);
+        } catch (e: any) {
+            console.log(e);
+            reportError(`Failed to record new Paddle subscription: ${e.message || e}`);
+        }
     }
 
     // All done

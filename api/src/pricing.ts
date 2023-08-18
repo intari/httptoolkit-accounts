@@ -100,6 +100,14 @@ export const PRICING: { [key: string]: Prices } = {
         'team-annual': 756
     },
 
+    'country:IDN': {
+        currency: 'IDR',
+        'pro-monthly': 40000,
+        'pro-annual': 300000,
+        'team-monthly': 60000,
+        'team-annual': 480000
+    },
+
     'country:IND': {
         currency: 'INR',
         'pro-monthly': 180,
@@ -122,6 +130,14 @@ export const PRICING: { [key: string]: Prices } = {
         'pro-annual': 8400,
         'team-monthly': 1400,
         'team-annual': 13200
+    },
+
+    'country:KOR': {
+        currency: 'KRW',
+        'pro-monthly': 9000,
+        'pro-annual': 84000,
+        'team-monthly': 14000,
+        'team-annual': 132000
     },
 
     'country:MEX': {
@@ -201,10 +217,10 @@ export const PRICING: { [key: string]: Prices } = {
 
     'continent:AS': { // Asia
         currency: 'USD',
-        'pro-monthly': 5,
-        'pro-annual': 36,
-        'team-monthly': 7,
-        'team-annual': 60
+        'pro-monthly': 4,
+        'pro-annual': 30,
+        'team-monthly': 6,
+        'team-annual': 48
     },
 
     'continent:NA': { // North America (but not US/Canada)

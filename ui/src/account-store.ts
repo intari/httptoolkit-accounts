@@ -3,16 +3,18 @@ import { makeObservable, observable, computed, flow } from 'mobx';
 
 import { reportError } from './errors';
 
+import { delay } from "../../module/src/util";
 import {
     getBillingData,
     updateTeamMembers,
+    cancelSubscription,
     loginEvents,
     initializeAuthUi,
     showLoginDialog,
     hideLoginDialog,
     logOut,
     BillingAccount
-} from '../../module/dist/auth';
+} from '../../module/src/auth';
 
 export class AccountStore {
 
@@ -21,6 +23,7 @@ export class AccountStore {
             user: observable,
             isMaybeLoggedIn: observable,
             isLoggedIn: computed,
+            isAccountUpdateInProcess: observable,
             userSubscription: computed,
             updateUser: flow.bound
         });
@@ -34,7 +37,6 @@ export class AccountStore {
 
         if (!isSSR) {
             initializeAuthUi({
-                apiBase: process.env.API_BASE,
                 closeable: false,
                 rememberLastLogin: false
             });
@@ -81,7 +83,7 @@ export class AccountStore {
         try {
             this.user = yield getBillingData();
             loginEvents.emit('user_data_loaded');
-        } catch (e) {
+        } catch (e: any) {
             console.log("Failed to load user data");
             reportError(e);
             this.user = undefined;
@@ -129,6 +131,67 @@ export class AccountStore {
     logOut() {
         logOut();
     }
+
+    // Set when we know a cancel is processing elsewhere:
+    isAccountUpdateInProcess = false;
+
+    get canManageSubscription() {
+        return !!this.userSubscription?.canManageSubscription;
+    }
+
+    cancelSubscription = flow(function * (this: AccountStore) {
+        try {
+            this.isAccountUpdateInProcess = true;
+            yield cancelSubscription();
+            yield this.waitForUserUpdate(() =>
+                !this.user?.subscription ||
+                this.user?.subscription.status === 'deleted'
+            );
+            console.log('Subscription cancellation confirmed');
+        } catch (e: any) {
+            console.log(e);
+            reportError(`Subscription cancellation failed: ${e.message || e}`);
+            throw e;
+        } finally {
+            this.isAccountUpdateInProcess = false;
+        }
+    }).bind(this);
+
+    private waitForUserUpdate = flow(function * (
+        this: AccountStore,
+        completedCheck: () => boolean
+    ) {
+        let focused = true;
+
+        const setFocused = () => {
+            focused = true;
+            this.updateUser();
+        };
+
+        const setUnfocused = () => {
+            focused = false;
+        };
+
+        window.addEventListener('focus', setFocused);
+        window.addEventListener('blur', setUnfocused);
+
+        // Keep checking the user's subscription data at intervals, whilst other processes
+        // (update from payment provider) complete elsewhere...
+        yield this.updateUser();
+        let ticksSinceCheck = 0;
+        while (!completedCheck()) {
+            yield delay(1000);
+            ticksSinceCheck += 1;
+
+            if (focused || ticksSinceCheck > 10) {
+                // Every 10s while blurred or 500ms while focused, check the user data:
+                ticksSinceCheck = 0;
+                yield this.updateUser();
+            }
+        }
+        window.removeEventListener('focus', setFocused);
+        window.removeEventListener('blur', setUnfocused);
+    }).bind(this);
 
 }
 

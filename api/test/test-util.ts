@@ -5,15 +5,17 @@ import { getLocal } from 'mockttp';
 import stoppable from 'stoppable';
 
 import { serveFunctions } from '@httptoolkit/netlify-cli/src/utils/serve-functions';
-import { TransactionData } from '../../module/src/types';
+
 import { AppMetadata } from '../src/auth0';
+import { PayProOrderDetails, PayProOrderListing } from '../src/paypro';
+import { PaddleTransaction } from '../src/paddle';
+
+export { delay } from "../../module/src/util";
 
 let idCounter = 1000;
 export function id() {
     return idCounter++;
 }
-
-export const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function generateKeyPair() {
     return crypto.generateKeyPairSync('rsa', {
@@ -34,12 +36,16 @@ export const {
     publicKey
 } = generateKeyPair();
 
+export const PAYPRO_IPN_VALIDATION_KEY = 'test_key_123';
+
 const keyWithoutHeaders = (key: string) => key.split('\n').slice(1, -2).join('\n');
 
 // We generate one key, then use it for both paddle webhook signing and our own
 // /get-app-data data signing, because we're lazy like that. It's good enough though.
 process.env.PADDLE_PUBLIC_KEY = keyWithoutHeaders(publicKey);
 process.env.SIGNING_PRIVATE_KEY = keyWithoutHeaders(privateKey);
+
+process.env.PAYPRO_IPN_VALIDATION_KEY = PAYPRO_IPN_VALIDATION_KEY;
 
 export const AUTH0_PORT = 9091;
 process.env.AUTH0_DOMAIN = `localhost:${AUTH0_PORT}`;
@@ -79,7 +85,29 @@ export const ipApiServer = getLocal({
     }
 });
 
-export const EXCHANGE_RATE_API_PORT = 9094;
+export const PROFITWELL_API_PORT = 9094;
+process.env.PROFITWELL_API_BASE_URL = `http://localhost:${PROFITWELL_API_PORT}`;
+
+export const profitwellApiServer = getLocal({
+    https: {
+        keyPath: path.join(__dirname, 'fixtures', 'test-ca.key'),
+        certPath: path.join(__dirname, 'fixtures', 'test-ca.pem'),
+        keyLength: 2048
+    }
+});
+
+export const PAYPRO_API_PORT = 9095;
+process.env.PAYPRO_API_BASE_URL = `http://localhost:${PAYPRO_API_PORT}`;
+
+export const payproApiServer = getLocal({
+    https: {
+        keyPath: path.join(__dirname, 'fixtures', 'test-ca.key'),
+        certPath: path.join(__dirname, 'fixtures', 'test-ca.pem'),
+        keyLength: 2048
+    }
+});
+
+export const EXCHANGE_RATE_API_PORT = 9096;
 process.env.EXCHANGE_RATE_BASE_URL = `http://localhost:${EXCHANGE_RATE_API_PORT}`;
 
 export const exchangeRateServer = getLocal({
@@ -104,6 +132,13 @@ export function givenExchangeRate(currency: string, rate: number) {
 export function givenUser(userId: string, email: string, appMetadata: {} | undefined = undefined) {
     return Promise.all([
         auth0Server
+        .forGet(`/api/v2/users/${userId}`)
+        .thenJson(200, {
+            email: email,
+            user_id: userId,
+            app_metadata: appMetadata
+        }),
+        auth0Server
         .forGet('/api/v2/users-by-email')
         .withQuery({ email })
         .thenJson(200, [
@@ -113,13 +148,6 @@ export function givenUser(userId: string, email: string, appMetadata: {} | undef
                 app_metadata: appMetadata
             }
         ]),
-        auth0Server
-        .forGet(`/api/v2/users/${userId}`)
-        .thenJson(200, {
-            email: email,
-            user_id: userId,
-            app_metadata: appMetadata
-        })
     ]);
 }
 
@@ -135,6 +163,13 @@ export function givenNoUsers() {
         .forGet('/api/v2/users-by-email')
         .thenJson(200, []);
 }
+
+export function givenAuthToken(authToken: string, userId: string) {
+    return auth0Server.forGet('/userinfo')
+        .withHeaders({ 'Authorization': 'Bearer ' + authToken })
+        .thenJson(200, { sub: userId });
+}
+
 export async function givenSubscription(subId: number) {
     const userId = id();
 
@@ -151,13 +186,50 @@ export async function givenSubscription(subId: number) {
     return { paddleUserId: userId };
 }
 
-export function givenTransactions(userId: number, transactions: TransactionData[]) {
+export function givenPaddleTransactions(userId: number, transactions: PaddleTransaction[]) {
     return paddleServer
         .forPost(`/api/2.0/user/${userId}/transactions`)
         .thenJson(200, {
             success: true,
             response: transactions
         });
+}
+
+export function givenPayProOrders(email: string, orders: PayProOrderDetails[]) {
+    return Promise.all([
+        payproApiServer
+        .forPost(`/api/Orders/GetList`)
+        .withJsonBodyIncluding({
+            search: { customerEmail: email }
+        })
+        .thenJson(200, {
+            isSuccess: true,
+            response: {
+                orders: orders.map(o => ({
+                    id: o.orderId,
+                    orderStatusId: o.orderStatusId,
+                    orderStatusName: o.orderStatusName,
+                    placedAtUtc: o.createdAt,
+                    customerBillingEmail: o.customer.email,
+                    paymentMethodName: o.paymentMethodName,
+                    invoiceUrl: o.invoiceLink
+                } as PayProOrderListing))
+            }
+        }),
+        payproApiServer
+        .forPost(`/api/Orders/GetOrderDetails`)
+        .thenCallback(async (request) => {
+            const orderId = (await request.body.getJson() as any).orderId;
+
+            return {
+                statusCode: 200,
+                json: {
+                    isSuccess: true,
+                    response: orders.find(o => o.orderId === orderId)
+                }
+            }
+        }),
+    ]);
 }
 
 // Create a team, with the given list of users, and 'undefined' for each

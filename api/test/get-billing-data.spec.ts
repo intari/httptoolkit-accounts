@@ -2,6 +2,7 @@ import * as net from 'net';
 import fetch from 'node-fetch';
 import * as jwt from 'jsonwebtoken';
 import stoppable from 'stoppable';
+import moment from 'moment';
 
 import { expect } from 'chai';
 
@@ -14,11 +15,18 @@ import {
     paddleServer,
     PADDLE_PORT,
     givenSubscription,
-    givenTransactions,
-    id
+    givenPaddleTransactions,
+    id,
+    givenPayProOrders,
+    payproApiServer,
+    PAYPRO_API_PORT
 } from './test-util';
 import { TransactionData } from '../../module/src/types';
 import { LICENSE_LOCK_DURATION_MS, TeamOwnerMetadata } from '../src/auth0';
+
+const asPaddleDate = (date: Date) => {
+    return moment.utc(date).format('YYYY-MM-DD HH:mm:ss');
+}
 
 const getBillingData = (server: net.Server, authToken?: string) => fetch(
     `http://localhost:${(server.address() as net.AddressInfo).port}/get-billing-data`,
@@ -56,12 +64,14 @@ describe('/get-billing-data', () => {
         await auth0Server.forPost('/oauth/token').thenReply(200);
 
         await paddleServer.start(PADDLE_PORT);
+        await payproApiServer.start(PAYPRO_API_PORT);
     });
 
     afterEach(async () => {
         await new Promise((resolve) => functionServer.stop(resolve));
         await auth0Server.stop();
         await paddleServer.stop();
+        await payproApiServer.stop();
     });
 
     describe("for unauthed users", () => {
@@ -91,13 +101,14 @@ describe('/get-billing-data', () => {
             const data = getJwtData(await response.text());
             expect(data).to.deep.equal({
                 email: userEmail,
-                transactions: []
+                transactions: [],
+                can_manage_subscription: false
             });
         });
     });
 
     describe("for Pro users", () => {
-        it("returns signed subscription data", async () => {
+        it("returns signed subscription data for older Paddle customers", async () => {
             const authToken = freshAuthToken();
             const userId = "abc";
             const userEmail = 'user@example.com';
@@ -116,21 +127,23 @@ describe('/get-billing-data', () => {
                         subscription_id: subId,
                         subscription_sku: 'pro-monthly',
                         subscription_plan_id: 550380,
-                        subscription_status: "active"
+                        subscription_status: "active",
+                        subscription_quantity: 1
                     }
                 });
 
             const { paddleUserId } = await givenSubscription(subId);
-            const transaction: TransactionData = {
+            const transactionDate = new Date();
+            transactionDate.setMilliseconds(0);
+            await givenPaddleTransactions(paddleUserId, [{
                 amount: "1.00",
                 currency: "USD",
-                created_at: new Date().toISOString(),
+                created_at: asPaddleDate(transactionDate),
                 order_id: "order-456",
                 product_id: 550380,
                 receipt_url: "receipt.example",
                 status: "completed"
-            };
-            await givenTransactions(paddleUserId, [transaction]);
+            }]);
 
             const response = await getBillingData(functionServer, authToken);
             expect(response.status).to.equal(200);
@@ -139,11 +152,154 @@ describe('/get-billing-data', () => {
             expect(data).to.deep.equal({
                 email: userEmail,
                 subscription_expiry: subExpiry,
-                subscription_id: subId,
                 subscription_sku: 'pro-monthly',
                 subscription_plan_id: 550380,
                 subscription_status: "active",
-                transactions: [transaction]
+                subscription_quantity: 1,
+                transactions: [{
+                    amount: "1.00",
+                    currency: "USD",
+                    created_at: transactionDate.toISOString(),
+                    order_id: "order-456",
+                    sku: 'pro-monthly',
+                    receipt_url: "receipt.example",
+                    status: "completed"
+                }],
+                can_manage_subscription: true
+            });
+        });
+
+        it("returns signed subscription data for new Paddle customers", async () => {
+            const authToken = freshAuthToken();
+            const userId = "abc";
+            const userEmail = 'user@example.com';
+
+            const subId = id();
+            const subExpiry = Date.now();
+
+            const { paddleUserId } = await givenSubscription(subId);
+
+            await auth0Server.forGet('/userinfo')
+                .withHeaders({ 'Authorization': 'Bearer ' + authToken })
+                .thenJson(200, { sub: userId });
+            await auth0Server.forGet('/api/v2/users/' + userId)
+                .thenJson(200, {
+                    email: userEmail,
+                    app_metadata: {
+                        payment_provider: 'paddle',
+                        paddle_user_id: paddleUserId,
+                        subscription_id: subId.toString(),
+                        subscription_expiry: subExpiry,
+                        subscription_sku: 'pro-monthly',
+                        subscription_plan_id: 550380,
+                        subscription_status: "active",
+                        subscription_quantity: 1
+                    }
+                });
+
+            const transactionDate = new Date();
+            transactionDate.setMilliseconds(0);
+            await givenPaddleTransactions(paddleUserId, [{
+                amount: "1.00",
+                currency: "USD",
+                created_at: asPaddleDate(transactionDate),
+                order_id: "order-456",
+                product_id: 550380,
+                receipt_url: "receipt.example",
+                status: "completed"
+            }]);
+
+            const response = await getBillingData(functionServer, authToken);
+            expect(response.status).to.equal(200);
+
+            const data = getJwtData(await response.text());
+            expect(data).to.deep.equal({
+                email: userEmail,
+                subscription_expiry: subExpiry,
+                subscription_sku: 'pro-monthly',
+                subscription_plan_id: 550380,
+                subscription_status: "active",
+                subscription_quantity: 1,
+                transactions: [{
+                    amount: "1.00",
+                    currency: "USD",
+                    created_at: transactionDate.toISOString(),
+                    order_id: "order-456",
+                    sku: 'pro-monthly',
+                    receipt_url: "receipt.example",
+                    status: "completed"
+                }],
+                can_manage_subscription: true
+            });
+        });
+
+        it("returns signed subscription data for PayPro customers", async () => {
+            const authToken = freshAuthToken();
+            const userId = "abc";
+            const userEmail = 'user@example.com';
+
+            const subId = id();
+            const subCreation = new Date();
+            const subExpiry = Date.now();
+
+            await auth0Server.forGet('/userinfo')
+                .withHeaders({ 'Authorization': 'Bearer ' + authToken })
+                .thenJson(200, { sub: userId });
+            await auth0Server.forGet('/api/v2/users/' + userId)
+                .thenJson(200, {
+                    email: userEmail,
+                    app_metadata: {
+                        payment_provider: 'paypro',
+                        subscription_id: subId.toString(),
+                        subscription_expiry: subExpiry,
+                        subscription_sku: 'pro-monthly',
+                        subscription_plan_id: 550380,
+                        subscription_status: "active",
+                        subscription_quantity: 1
+                    }
+                });
+
+            const orderId = 12345;
+            await givenPayProOrders(userEmail, [{
+                orderId,
+                billingCurrencyCode: 'EUR',
+                billingTotalPrice: 60,
+                customer: { email: userEmail },
+                invoiceLink: 'https://invoice-url',
+                orderStatusId: 5,
+                orderStatusName: 'Processed',
+                paymentMethodName: 'Credit card',
+                createdAt: subCreation.toISOString().slice(0, -1), // PayPro's funky format
+                orderItems: [{
+                    billingPrice: 60,
+                    sku: 'pro-annual',
+                    orderItemName: 'HTTP Toolkit Pro (annual)',
+                    quantity: 1
+                }]
+            }]);
+
+            const response = await getBillingData(functionServer, authToken);
+            expect(response.status).to.equal(200);
+
+            const data = getJwtData(await response.text());
+            expect(data).to.deep.equal({
+                email: userEmail,
+                subscription_expiry: subExpiry,
+                subscription_sku: 'pro-monthly',
+                subscription_plan_id: 550380,
+                subscription_status: "active",
+                subscription_quantity: 1,
+                transactions: [{
+                    amount: "60.00",
+                    currency: "EUR",
+                    created_at: subCreation.toISOString(),
+                    order_id: "12345",
+                    sku: 'pro-annual',
+                    receipt_url: "https://invoice-url",
+                    status: "completed"
+                } as TransactionData],
+                can_manage_subscription: true,
+                update_url: 'https://cc.payproglobal.com/Customer/Account/Login'
             });
         });
 
@@ -172,7 +328,7 @@ describe('/get-billing-data', () => {
                 });
 
             const { paddleUserId } = await givenSubscription(subId);
-            await givenTransactions(paddleUserId, []);
+            await givenPaddleTransactions(paddleUserId, []);
 
             const response1 = await getBillingData(functionServer, authToken);
             expect(response1.status).to.equal(200);
@@ -236,7 +392,8 @@ describe('/get-billing-data', () => {
                     id: billingUserId,
                     name: billingUserEmail
                 },
-                transactions: []
+                transactions: [],
+                can_manage_subscription: false
             });
         });
 
@@ -302,16 +459,17 @@ describe('/get-billing-data', () => {
                 ]);
 
             const { paddleUserId } = await givenSubscription(subId);
-            const transaction: TransactionData = {
+            const transactionDate = new Date();
+            transactionDate.setMilliseconds(0);
+            await givenPaddleTransactions(paddleUserId, [{
                 amount: "1.00",
                 currency: "USD",
-                created_at: new Date().toISOString(),
+                created_at: asPaddleDate(transactionDate),
                 order_id: "order-456",
                 product_id: 550789,
                 receipt_url: "receipt.example",
                 status: "completed"
-            };
-            await givenTransactions(paddleUserId, [transaction]);
+            }]);
 
             const response = await getBillingData(functionServer, authToken);
             expect(response.status).to.equal(200);
@@ -321,7 +479,6 @@ describe('/get-billing-data', () => {
                 email: billingUserEmail,
 
                 subscription_expiry: subExpiry,
-                subscription_id: subId,
                 locked_license_expiries: [
                     // Locked for ~30 years
                     new Date(2050, 0, 0).getTime() + LICENSE_LOCK_DURATION_MS
@@ -333,8 +490,17 @@ describe('/get-billing-data', () => {
                 last_receipt_url: 'lru',
                 cancel_url: 'cu',
                 update_url: 'uu',
+                can_manage_subscription: true,
 
-                transactions: [transaction],
+                transactions: [{
+                    amount: "1.00",
+                    currency: "USD",
+                    created_at: transactionDate.toISOString(),
+                    order_id: "order-456",
+                    sku: 'team-monthly',
+                    receipt_url: "receipt.example",
+                    status: "completed"
+                }],
                 team_members: [
                     { id: '1', name: team[0].email, locked: false },
                     // Rejected due to lock:
@@ -386,16 +552,18 @@ describe('/get-billing-data', () => {
                 ]);
 
             const { paddleUserId } = await givenSubscription(subId);
-            const transaction: TransactionData = {
+            const transactionDate = new Date();
+            transactionDate.setMilliseconds(0);
+
+            await givenPaddleTransactions(paddleUserId, [{
                 amount: "1.00",
                 currency: "USD",
-                created_at: new Date().toISOString(),
+                created_at: asPaddleDate(transactionDate),
                 order_id: "order-456",
                 product_id: 550789,
                 receipt_url: "receipt.example",
                 status: "completed"
-            };
-            await givenTransactions(paddleUserId, [transaction]);
+            }]);
 
             const response = await getBillingData(functionServer, authToken);
             expect(response.status).to.equal(200);
@@ -405,7 +573,6 @@ describe('/get-billing-data', () => {
                 email: billingUserEmail,
 
                 subscription_expiry: subExpiry,
-                subscription_id: subId,
                 subscription_quantity: 1,
                 subscription_sku: 'team-monthly',
                 subscription_plan_id: 550789,
@@ -413,8 +580,17 @@ describe('/get-billing-data', () => {
                 last_receipt_url: 'lru',
                 cancel_url: 'cu',
                 update_url: 'uu',
+                can_manage_subscription: true,
 
-                transactions: [transaction],
+                transactions: [{
+                    amount: "1.00",
+                    currency: "USD",
+                    created_at: transactionDate.toISOString(),
+                    order_id: "order-456",
+                    sku: 'team-monthly',
+                    receipt_url: "receipt.example",
+                    status: "completed"
+                }],
                 team_owner: { id: billingUserId, name: billingUserEmail },
                 team_members: [
                     { id: billingUserId, name: billingUserEmail, locked: false }
@@ -462,6 +638,7 @@ describe('/get-billing-data', () => {
             expect(data).to.deep.equal({
                 email: teamUserEmail,
                 transactions: [],
+                can_manage_subscription: false,
                 team_owner: {
                     id: billingUserId,
                     name: billingUserEmail,
@@ -509,6 +686,7 @@ describe('/get-billing-data', () => {
             expect(data).to.deep.equal({
                 email: teamUserEmail,
                 transactions: [],
+                can_manage_subscription: false,
                 team_owner: {
                     id: billingUserId,
                     name: billingUserEmail,
@@ -554,6 +732,7 @@ describe('/get-billing-data', () => {
             expect(data).to.deep.equal({
                 email: teamUserEmail,
                 transactions: [],
+                can_manage_subscription: false,
                 team_owner: {
                     id: billingUserId,
                     name: billingUserEmail,

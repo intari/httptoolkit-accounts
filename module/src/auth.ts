@@ -9,8 +9,9 @@ import { Auth0LockPasswordless } from '@httptoolkit/auth0-lock';
 const auth0Dictionary = require('@httptoolkit/auth0-lock/lib/i18n/en').default;
 import * as dedent from 'dedent';
 
-import { SubscriptionData, SubscriptionPlanCode, UserAppData, UserBillingData } from "./types";
-import { getSubscriptionPlanCode } from './plans';
+import { SKU, SubscriptionData, UserAppData, UserBillingData } from "./types";
+import { ACCOUNTS_API_BASE } from './util';
+import { getSKUForPaddleId } from './plans';
 
 const AUTH0_CLIENT_ID = 'KAJyF1Pq9nfBrv5l3LHjT9CrSQIleujj';
 const AUTH0_DOMAIN = 'login.httptoolkit.tech';
@@ -30,24 +31,50 @@ mCVpul3MYubdv034/ipGZSKJTwgubiHocrSBdeImNe3xdxOw/Mo04r0kcZBg2l/b
 -----END PUBLIC KEY-----
 `;
 
+export class TokenRejectedError extends TypedError {
+    constructor() {
+        super('Auth token rejected');
+    }
+}
+
 export class RefreshRejectedError extends TypedError {
     constructor(response: { description: string }) {
         super(`Token refresh failed with: ${response.description}`);
     }
 }
 
+// Both always set as long as initializeAuthUi has been called.
+let auth0Client: Auth0.Authentication | undefined;
 let auth0Lock: typeof Auth0LockPasswordless | undefined;
 export const loginEvents = new EventEmitter();
 
-let apiBase: string;
-
 export const initializeAuthUi = (options: {
-    apiBase?: string,
+    /**
+     * Do we want a persistent refresh token, or just a normal session? Defaults to false.
+     */
     refreshToken?: boolean,
+
+    /**
+     * Should one-click login be available? Should be enabled for cases where you might log
+     * in and out, or be logged out automatically (no refresh token) and disabled for most
+     * long-term persistent usage.
+     *
+     * Defaults to true.
+     */
     rememberLastLogin?: boolean,
+
+    /**
+     * Allow closing the login UI. This may need to be disabled in some environments (e.g. the dashboard)
+     * where the login prompt is modal, not optional.
+     *
+     * Defaults to true.
+     */
     closeable?: boolean
 } = {}) => {
-    apiBase = options.apiBase ?? "https://accounts.httptoolkit.tech/api";
+    auth0Client = new Auth0.Authentication({
+        clientID: AUTH0_CLIENT_ID,
+        domain: AUTH0_DOMAIN
+    });
 
     auth0Lock = new Auth0LockPasswordless(AUTH0_CLIENT_ID, AUTH0_DOMAIN, {
         configurationBaseUrl: 'https://cdn.eu.auth0.com',
@@ -82,7 +109,7 @@ export const initializeAuthUi = (options: {
         closable: options.closeable ?? true,
         theme: {
             primaryColor: '#e1421f',
-            logo: 'https://httptoolkit.tech/icon-600.png'
+            logo: 'https://httptoolkit.com/icon-600.png'
         },
         languageDictionary: Object.assign(auth0Dictionary, {
             title: 'Log in / Sign up',
@@ -102,6 +129,15 @@ export const initializeAuthUi = (options: {
     ].forEach((event) => auth0Lock!.on(event, (data) => loginEvents.emit(event, data)));
 
     loginEvents.on('user_data_loaded', () => auth0Lock!.hide());
+
+    // Synchronously load & parse the latest token value we have, if any
+    try {
+        // ! because actually parse(null) -> null, so it's ok
+        tokens = JSON.parse(localStorage.getItem('tokens')!);
+    } catch (e) {
+        console.log('Invalid token', localStorage.getItem('tokens'), e);
+        loginEvents.emit('app_error', 'Failed to parse saved auth token');
+    }
 };
 
 export const showLoginDialog = () => {
@@ -134,24 +170,10 @@ export const logOut = () => {
     loginEvents.emit('logout');
 };
 
-const auth0Client = new Auth0.Authentication({
-    clientID: AUTH0_CLIENT_ID, domain: AUTH0_DOMAIN
-});
-
-let tokens: {
-    refreshToken?: string;
-    accessToken: string;
-    accessTokenExpiry: number; // time in ms
-} | null;
-
-// Synchronously load & parse the latest token value we have, if any
-try {
-    // ! because actually parse(null) -> null, so it's ok
-    tokens = JSON.parse(localStorage.getItem('tokens')!);
-} catch (e) {
-    console.log('Invalid token', localStorage.getItem('tokens'), e);
-    loginEvents.emit('app_error', 'Failed to parse saved auth token');
-}
+let tokens:
+    | { refreshToken?: string; accessToken: string; accessTokenExpiry: number; /* time in ms */ }
+    | null // Initialized but not logged in
+    | undefined; // Not initialized
 
 const tokenMutex = new Mutex();
 
@@ -181,7 +203,7 @@ async function refreshToken() {
         // If we have a permanent refresh token, we send it to Auth0 to get a
         // new fresh access token:
         return new Promise<string>((resolve, reject) => {
-            auth0Client.oauthToken({
+            auth0Client!.oauthToken({
                 refreshToken: tokens!.refreshToken,
                 grantType: 'refresh_token'
             }, (error: any, result: { accessToken: string, expiresIn: number }) => {
@@ -247,31 +269,32 @@ function getToken() {
 export type SubscriptionStatus = 'active' | 'trialing' | 'past_due' | 'deleted';
 
 interface Subscription {
-    id: number;
     status: SubscriptionStatus;
-    plan: SubscriptionPlanCode;
+    plan: SKU;
     quantity: number;
     expiry: Date;
     updateBillingDetailsUrl?: string;
     cancelSubscriptionUrl?: string;
     lastReceiptUrl?: string;
+    canManageSubscription: boolean;
 };
 
 interface BaseAccountData {
     email?: string;
     subscription?: Subscription;
+    banned: boolean;
 }
 
 export interface User extends BaseAccountData {
     featureFlags: string[];
 }
 
-const anonUser = (): User => ({ featureFlags: [] });
+const anonUser = (): User => ({ featureFlags: [], banned: false });
 
 export interface Transaction {
     orderId: string;
     receiptUrl: string;
-    productId: number;
+    sku: SKU;
     createdAt: string;
     status: string;
 
@@ -293,7 +316,7 @@ export interface TeamOwner {
 }
 
 export interface BillingAccount extends BaseAccountData {
-    transactions: Transaction[];
+    transactions: Transaction[] | null;
 
     // Only define if you are a member of a team:
     teamOwner?: TeamOwner;
@@ -303,7 +326,7 @@ export interface BillingAccount extends BaseAccountData {
     lockedLicenseExpiries?: number[]; // Timestamps when locked licenses will unlock
 }
 
-const anonBillingAccount = (): BillingAccount => ({ transactions: [] });
+const anonBillingAccount = (): BillingAccount => ({ transactions: [], banned: false });
 
 /*
  * Synchronously gets the last received user data, _without_
@@ -359,7 +382,8 @@ function parseUserData(userJwt: string | null): User {
     return {
         email: appData.email,
         subscription: parseSubscriptionData(appData),
-        featureFlags: appData.feature_flags || []
+        featureFlags: appData.feature_flags || [],
+        banned: !!appData.banned
     };
 }
 
@@ -372,16 +396,16 @@ function parseBillingData(userJwt: string | null): BillingAccount {
         issuer: 'https://httptoolkit.tech/'
     });
 
-    const transactions = billingData.transactions.map((transaction) => ({
+    const transactions = billingData.transactions?.map((transaction) => ({
         orderId: transaction.order_id,
         receiptUrl: transaction.receipt_url,
-        productId: transaction.product_id,
+        sku: transaction.sku,
         createdAt: transaction.created_at,
         status: transaction.status,
 
         amount: transaction.amount,
         currency: transaction.currency
-    }));
+    })) ?? null; // Null => transactions timed out upstream, not available.
 
     return {
         email: billingData.email,
@@ -389,20 +413,22 @@ function parseBillingData(userJwt: string | null): BillingAccount {
         transactions,
         teamMembers: billingData.team_members,
         teamOwner: billingData.team_owner,
-        lockedLicenseExpiries: billingData.locked_license_expiries
+        lockedLicenseExpiries: billingData.locked_license_expiries,
+        banned: !!billingData.banned
     };
 }
 
 function parseSubscriptionData(rawData: SubscriptionData) {
     const subscription = {
-        id: rawData.subscription_id,
         status: rawData.subscription_status,
-        plan: getSubscriptionPlanCode(rawData.subscription_plan_id),
+        plan: rawData.subscription_sku
+            ?? getSKUForPaddleId(rawData.subscription_plan_id),
         quantity: rawData.subscription_quantity,
         expiry: rawData.subscription_expiry ? new Date(rawData.subscription_expiry) : undefined,
         updateBillingDetailsUrl: rawData.update_url,
         cancelSubscriptionUrl: rawData.cancel_url,
-        lastReceiptUrl: rawData.last_receipt_url
+        lastReceiptUrl: rawData.last_receipt_url,
+        canManageSubscription: !!rawData.can_manage_subscription
     };
 
     if (_.some(subscription) && !subscription.plan) {
@@ -417,17 +443,25 @@ function parseSubscriptionData(rawData: SubscriptionData) {
         'cancelSubscriptionUrl'
     ];
 
+    const isCompleteSubscriptionData = _.every(
+        _.omit(subscription, ...optionalFields),
+        v => !_.isNil(v) // Not just truthy: canManageSubscription can be false on valid sub
+    );
+
     // Use undefined rather than {} or partial data when there's any missing required sub fields
-    return _.every(_.omit(subscription, ...optionalFields))
+    return isCompleteSubscriptionData
         ? subscription as Subscription
         : undefined
 }
 
-async function requestUserData(type: 'app' | 'billing'): Promise<string> {
+async function requestUserData(
+    type: 'app' | 'billing',
+    options: { isRetry?: boolean } = {}
+): Promise<string> {
     const token = await getToken();
     if (!token) return '';
 
-    const appDataResponse = await fetch(`${apiBase}/get-${type}-data`, {
+    const appDataResponse = await fetch(`${ACCOUNTS_API_BASE}/get-${type}-data`, {
         method: 'GET',
         headers: {
             'Authorization': `Bearer ${token}`
@@ -438,6 +472,20 @@ async function requestUserData(type: 'app' | 'billing'): Promise<string> {
         console.log(`Received ${appDataResponse.status} loading ${type} data, with body: ${
             await appDataResponse.text()
         }`);
+
+        if (appDataResponse.status === 401) {
+            // We allow a single refresh+retry. If it's passed, we fail.
+            if (options.isRetry) throw new TokenRejectedError();
+
+            // If this is a first failure, let's assume it's a blip with our access token,
+            // so a refresh is worth a shot (worst case, it'll at least confirm we're unauthed).
+            return tokenMutex.runExclusive(() =>
+                refreshToken()
+            ).then(() =>
+                requestUserData(type, { isRetry: true })
+            );
+        }
+
         throw new Error(`Failed to load ${type} data`);
     }
 
@@ -449,9 +497,9 @@ export async function updateTeamMembers(
     emailsToAdd: string[]
 ): Promise<void> {
     const token = await getToken();
-    if (!token) throw new Error("Not authenticated");
+    if (!token) throw new Error("Can't update team without an auth token");
 
-    const appDataResponse = await fetch(`${apiBase}/update-team`, {
+    const appDataResponse = await fetch(`${ACCOUNTS_API_BASE}/update-team`, {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${token}`,
@@ -464,5 +512,21 @@ export async function updateTeamMembers(
         const responseBody = await appDataResponse.text();
         console.log(`Received ${appDataResponse.status} updating team members: ${responseBody}`);
         throw new Error(responseBody || `Failed to update team members`);
+    }
+}
+
+export async function cancelSubscription() {
+    const token = await getToken();
+    if (!token) throw new Error("Can't cancel account without an auth token");
+
+    const response = await fetch(`${ACCOUNTS_API_BASE}/cancel-subscription`, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`
+        }
+    });
+
+    if (!response.ok) {
+        throw new Error(`Unexpected ${response.status} response cancelling subscription`);
     }
 }

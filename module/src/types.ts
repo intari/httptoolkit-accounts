@@ -1,25 +1,25 @@
 import type { SubscriptionPlans } from "./plans";
 
+export type SKU = keyof typeof SubscriptionPlans;
+
+// We only support pro-perpetual for special cases - it's not priced
+// or shown on pricing/checkout pages:
+export type PricedSKU = Exclude<SKU, 'pro-perpetual'>;
+
 // Valid subscription state values:
-export type SubscriptionPlanCode = keyof typeof SubscriptionPlans;
 export type SubscriptionStatus =
     | 'active'
     | 'trialing'
     | 'past_due'
     | 'deleted';
 
-export type SKU =
-    | 'pro-monthly'
-    | 'pro-annual'
-    | 'pro-perpetual'
-    | 'team-monthly'
-    | 'team-annual';
+export type Interval =
+    | 'monthly'
+    | 'annual'
+    | 'perpetual';
 
-// We only support pro-perpetual for special cases - it's not priced
-// or shown on pricing/checkout pages:
-export type PricedSKU = Exclude<SKU, 'pro-perpetual'>;
-
-export type SubscriptionPricing = {
+// Subscription plan pricing, as returned by the API
+export interface SubscriptionPricing {
     product_id: number; // Paddle-specific id
     sku: SKU;
     product_title: string;
@@ -48,7 +48,8 @@ export type UserAppData = {
 // User billing data, as returned by the API
 export type UserBillingData = {
     email: string;
-    transactions: TransactionData[];
+    banned?: boolean;
+    transactions: TransactionData[] | null;
 
     // Team members only:
     team_owner?: {
@@ -70,14 +71,18 @@ export type UserBillingData = {
 // Subscription data as returned by the API
 export interface SubscriptionData {
     subscription_status?: SubscriptionStatus;
-    paddle_user_id?: number;
-    subscription_id?: number;
     subscription_sku?: SKU;
-    subscription_plan_id?: number;
     subscription_expiry?: number;
     update_url?: string;
     cancel_url?: string;
     last_receipt_url?: string;
+
+    /**
+     * Deprecated in favour of sub_sku. We can't remove this for a while, as old UIs (pre-3/2023)
+     * will not understand subs without it, and will treat them as no subscription at all.
+     * @deprecated
+     **/
+    subscription_plan_id?: number;
 
     // Team subs only:
     subscription_quantity?: number;
@@ -85,33 +90,46 @@ export interface SubscriptionData {
 
     // Team members only:
     subscription_owner_id?: string;
+
+    // Team owners and Pro users can manage the subscription (cancel, update billing details, etc).
+    // Team members can see basic details, but can't manage them.
+    // This isn't a security mechanism - it's more like an indicative check for UX to decide
+    // whether cancel/update buttons should show. Real check happens in API endpoints.
+    can_manage_subscription?: boolean;
 }
 
+// Transaction data, as returned within API billing responses
 export interface TransactionData {
-    order_id: string;
-    receipt_url: string;
-    product_id: number;
-    created_at: string;
-    status: string;
+    order_id: string; // Used as key
+    receipt_url: string; // url
+    sku: SKU; // Used to show plan name for this order
+    created_at: string; // Used for date, ISO format UTC
+    status:
+        | 'completed'
+        | 'refunded'
+        | 'partially_refunded'
+        | 'disputed'
+        | 'waiting'
+        | 'canceled';
 
-    currency: string;
+    currency: string; // Shown together as total paid
     amount: string;
 }
 
 // User model in JS
-export type User = {
+export interface User {
     email?: string;
     subscription?: Subscription;
     featureFlags: string[];
-};
+}
 
 // Subscription data model in JS
-export type Subscription = {
+export interface Subscription {
     id: number;
     status: SubscriptionStatus;
-    plan: SubscriptionPlanCode;
+    plan: SKU;
     expiry: Date;
     updateBillingDetailsUrl?: string;
     cancelSubscriptionUrl?: string;
     lastReceiptUrl?: string;
-};
+}

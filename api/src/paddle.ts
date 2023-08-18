@@ -5,6 +5,8 @@ import { URLSearchParams } from 'url';
 import fetch, { RequestInit } from 'node-fetch';
 import Serialize from 'php-serialize';
 import NodeCache from 'node-cache';
+import moment from 'moment';
+import { TypedError } from 'typed-error';
 
 import { reportError, StatusError } from './errors';
 import { getLatestRates } from './exchange-rates';
@@ -172,6 +174,15 @@ export function validatePaddleWebhook(webhookData: PaddleWebhookData) {
     if (!verification) throw new Error('Webhook signature was invalid');
 }
 
+export class PaddleApiError extends TypedError {
+    constructor(
+        public readonly code?: number,
+        public readonly message: string = 'Unknown Paddle error'
+    ) {
+        super(`Unsuccessful response from Paddle API: ${message} (${code})`);
+    }
+}
+
 async function makePaddleApiRequest(url: string, options: RequestInit = {}) {
     url = url.startsWith('/')
         ? PADDLE_BASE_URL + url
@@ -191,7 +202,9 @@ async function makePaddleApiRequest(url: string, options: RequestInit = {}) {
 
     if (!data.success) {
         console.log(`Unsuccessful Paddle response: `, JSON.stringify(data));
-        throw new Error("Unsuccessful response from Paddle API");
+        const errorCode = data.error?.code;
+        const errorMessage = data.error?.message;
+        throw new PaddleApiError(errorCode, errorMessage);
     }
 
     return data.response;
@@ -222,7 +235,7 @@ export async function getPrices(productIds: string[], sourceIp: string): Promise
 }
 
 export async function getPaddleUserIdFromSubscription(
-    subscriptionId: number | undefined
+    subscriptionId: number | string | undefined
 ): Promise<number | undefined> {
     if (!subscriptionId) return undefined;
 
@@ -247,8 +260,21 @@ export async function getPaddleUserIdFromSubscription(
     }
 }
 
-export async function getPaddleUserTransactions(
-    userId: number
+export interface PaddleTransaction {
+    order_id: string; // Used as key
+    receipt_url: string;
+    product_id: number; // Used to show plan name for this order
+    created_at: string; // E.g. "2020-09-03 02:50:36" in UTC
+
+    status: 'completed' | 'refunded' | 'partially_refunded' | 'disputed';
+    // Status is shown in the dashboard, title cased.
+
+    currency: string;
+    amount: string;
+}
+
+export async function lookupPaddleUserTransactions(
+    userId: string | number
 ): Promise<TransactionData[]> {
     const response = await makePaddleApiRequest(
         `/api/2.0/user/${userId}/transactions`, {
@@ -260,16 +286,22 @@ export async function getPaddleUserTransactions(
         }
     );
 
-    // Expose this data as objects with only the minimal set of relevant keys for now:
-    return response.map((transaction: TransactionData) => _.pick(transaction, [
-        'order_id',
-        'receipt_url',
-        'product_id',
-        'created_at',
-        'status',
-        'currency',
-        'amount'
-    ]));
+    // Expose this data as objects with minor trimming & transformation:
+    return response.map((transaction: PaddleTransaction) => ({
+        ..._.pick(transaction, [
+            'order_id',
+            'receipt_url',
+            'status',
+            'currency',
+            'amount'
+        ]),
+        // Switch to UTC ISO from Paddle's funky date format:
+        created_at: moment.utc(
+            transaction.created_at,
+            "YYYY-MM-DD HH:mm:ss"
+        ).toISOString(),
+        sku: getSkuForPaddleId(transaction.product_id)
+    }));
 }
 
 // Taken from https://www.paddle.com/help/start/intro-to-paddle/what-currencies-do-you-support
@@ -316,13 +348,14 @@ export async function createCheckout(options: {
     sku: SKU,
     email?: string, // Almost always set, except manual purchase links
     quantity?: number, // Always set for team accounts
+    discountCode?: string,
     countryCode?: string,
     currency: string,
     price: number,
     source: string,
     returnUrl?: string,
     passthrough?: string
-}) {
+}): Promise<string> {
     const cacheKey = JSON.stringify(options);
     if (checkoutCache.has(cacheKey)) return checkoutCache.get<string>(cacheKey)!;
 
@@ -402,6 +435,11 @@ export async function createCheckout(options: {
             : {}
         ),
 
+        ...(options.discountCode
+            ? { coupon_code: options.discountCode }
+            : {}
+        ),
+
         referring_domain: options.source,
         ...(options.returnUrl
             ? { return_url: options.returnUrl }
@@ -414,16 +452,45 @@ export async function createCheckout(options: {
         ...priceParams
     });
 
-    console.log('CHECKOUT PARAMS', checkoutParams.toString());
+    try {
+        const response = await makePaddleApiRequest(
+            `/api/2.0/product/generate_pay_link`, {
+                method: 'POST',
+                body: checkoutParams
+            }
+        );
 
-    const response = await makePaddleApiRequest(
-        `/api/2.0/product/generate_pay_link`, {
+        checkoutCache.set<string>(cacheKey, response.url);
+
+        return response.url as string;
+    } catch (e) {
+        if (e instanceof PaddleApiError && e.code === 175) {
+            // 175 => Invalid country code (https://developer.paddle.com/api-reference/324ed7bfd28c8-api-error-codes#list-of-error-codes-and-messages)
+
+            reportError(`Paddle checkout creation failure due to ${options.countryCode} country code`);
+
+            // Paddle can reject some country codes. Here we work around that, by just skipping the country
+            // entirely in that case, and the user can sort it themselves (or fight with Paddle's support team
+            // and complain directly, if not):
+            return createCheckout({
+                ...options,
+                countryCode: undefined
+            });
+        } else {
+            throw e;
+        }
+    }
+}
+
+export async function cancelSubscription(subscriptionId: string | number) {
+    await makePaddleApiRequest(
+        `/api/2.0/subscription/users_cancel`, {
             method: 'POST',
-            body: checkoutParams
+            body: new URLSearchParams({
+                vendor_id: PADDLE_VENDOR_ID,
+                vendor_auth_code: PADDLE_KEY,
+                subscription_id: subscriptionId.toString()
+            })
         }
     );
-
-    checkoutCache.set<string>(cacheKey, response.url);
-
-    return response.url as string;
 }

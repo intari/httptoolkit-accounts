@@ -1,9 +1,7 @@
 import * as _ from 'lodash';
 import * as React from 'react';
 import { observer } from 'mobx-react-lite';
-import {
-    parse as parseDate
-} from 'date-fns';
+import { parseISO } from 'date-fns';
 
 import { styled } from './styles';
 
@@ -12,7 +10,7 @@ import type {
 } from '../../module/src/auth';
 
 import {
-    getPlanById
+    getPlanByCode
 } from '../../module/src/plans';
 
 export const Transactions = observer((p: {
@@ -26,17 +24,13 @@ export const Transactions = observer((p: {
         >
             <TransactionDescription>
                 {
-                    getPlanById(transaction.productId)?.name
+                    getPlanByCode(transaction.sku)?.name
                     ?? 'Unknown'
                 }
             </TransactionDescription>
 
             <TransactionDate>
-                { parseDate(
-                    transaction.createdAt + "Z", // Z to make UTC TZ explicit
-                    "yyyy-LL-dd HH:mm:ssX",
-                    new Date()
-                ).toLocaleDateString() }
+                { parseISO(transaction.createdAt).toLocaleDateString() }
             </TransactionDate>
 
             <TransactionResultWrapper>
